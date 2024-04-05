@@ -1,0 +1,17 @@
+{
+  "tenantsettings": [
+    {
+      "tenantid": "345",
+      "velocitylimits": {
+        "daily": "2500"
+      },
+      "thresholds": {
+        "pertransaction": "1500"
+      },
+      "countrysanctions": {
+        "sourcecountrycode": "AFG, BLR, BIH, IRQ, KEN, RUS",
+        "destinationcountrycode": "AFG, BLR, BIH, IRQ, KEN, RUS, TKM, UGA"
+      }
+    }
+  ]
+}
