@@ -1,14 +1,13 @@
 using Demo_DurableFunction.Models;
+using Microsoft.Azure.Amqp.Framing;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
 using System.Threading.Tasks;
 
 namespace Demo_DurableFunction
@@ -24,8 +23,11 @@ namespace Demo_DurableFunction
             // Load tenant specific settings
             var tenantSettings = await context.CallActivityAsync<TenantSettings>("LoadTenantSettings", transaction.TenantId);
 
+            // Load Tenant Velocity
+            var tenantVelocities = await context.CallActivityAsync<TenantVelocity>("LoadTenantVelocities", transaction);
+
             // Assess the incoming message against the restrictions defined in the Tenant settings
-            var violations = AssessRestrictions(transaction, tenantSettings);
+            var violations = AssessRestrictions(transaction, tenantSettings, tenantVelocities);
 
             if (violations.Any())
             {
@@ -72,6 +74,45 @@ namespace Demo_DurableFunction
         [FunctionName("SendToProcessingQueue")]
         public static void SendToProcessingQueue([ActivityTrigger] TransactionModel transaction, ILogger log)
         {
+            // Specify the path to your JSON file
+            string filePath = string.Format("{0}/Content/TenantVelocities.json", Directory.GetCurrentDirectory());
+
+            if (!File.Exists(filePath))
+            {
+                // Create the file
+                using (FileStream fs = File.Create(filePath))
+                {
+                    Console.WriteLine("File created successfully.");
+                }
+            }
+
+            // Read the JSON file
+            string tenantVelocitiesJson = File.ReadAllText(filePath);
+
+            // deserialize object
+            var tenantVelocityWrapper = JsonConvert.DeserializeObject<TenantVelocityWrapper>(tenantVelocitiesJson);
+
+            tenantVelocityWrapper = tenantVelocityWrapper ?? new TenantVelocityWrapper();
+
+            if (tenantVelocityWrapper.TenantVelocities.Any(x => x.TenantId == transaction.TenantId && x.TransactionDate.HasValue && x.TransactionDate == transaction.TransactionDate))
+            {
+                foreach (var item in tenantVelocityWrapper.TenantVelocities.Where(x => x.TenantId == transaction.TenantId && x.TransactionDate.HasValue && x.TransactionDate == transaction.TransactionDate))
+                {
+                    item.PaymentProcessed = item.PaymentProcessed + transaction.Amount;
+                }
+            }
+            else
+            {
+                tenantVelocityWrapper.TenantVelocities.Add(new TenantVelocity
+                {
+                    TenantId = transaction.TenantId,
+                    Date = transaction.TransactionDate.ToString("yyyy-MM-dd"),
+                    PaymentProcessed = transaction.Amount
+                });
+            }
+            // Write data to the file
+            File.WriteAllText(filePath, JsonConvert.SerializeObject(tenantVelocityWrapper));
+
             log.LogInformation($"Sending transaction {transaction.TransactionId} to processing queue.");
         }
 
@@ -85,7 +126,7 @@ namespace Demo_DurableFunction
         public static TenantSettings LoadTenantSettings([ActivityTrigger] string tenantId, ILogger log)
         {
             // Specify the path to your JSON file
-            string filePath = string.Format("{0}/Content/TenantSettings.json", Directory.GetCurrentDirectory()) ;
+            string filePath = string.Format("{0}/Content/TenantSettings.json", Directory.GetCurrentDirectory());
 
             // Check if the file exists
             if (!File.Exists(filePath))
@@ -106,21 +147,67 @@ namespace Demo_DurableFunction
         }
 
         /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="tenantId"></param>
+        /// <param name="log"></param>
+        /// <returns></returns>
+        [FunctionName("LoadTenantVelocities")]
+        public static TenantVelocity LoadTenantVelocities([ActivityTrigger] TransactionModel model, ILogger log)
+        {
+            // Specify the path to your JSON file
+            string filePath = string.Format("{0}/Content/TenantVelocities.json", Directory.GetCurrentDirectory());
+
+            // Check if the file exists
+            if (!File.Exists(filePath))
+            {
+                Console.WriteLine("File not found.");
+
+                // Create the file
+                using (FileStream fs = File.Create(filePath))
+                {
+                    Console.WriteLine("File created successfully.");
+                }
+
+                return null;
+            }
+            else
+            {
+                // Read the JSON file
+                string tenantVelocitiesJson = File.ReadAllText(filePath);
+
+                // deserialize object
+                var tenantVelocities = JsonConvert.DeserializeObject<TenantVelocityWrapper>(tenantVelocitiesJson);
+
+                return tenantVelocities.TenantVelocities.FirstOrDefault(x => x.TenantId == model.TenantId && x.TransactionDate.HasValue && x.TransactionDate == model.TransactionDate);
+            }
+        }
+
+        /// <summary>
         /// check for the violations based on transaction & tenant settings
         /// </summary>
         /// <param name="transaction"></param>
         /// <param name="tenantSettings"></param>
         /// <returns></returns>
-        private static List<string> AssessRestrictions(TransactionModel transaction, TenantSettings tenantSettings)
+        private static List<string> AssessRestrictions(TransactionModel transaction, TenantSettings tenantSettings, TenantVelocity tenantVelocity)
         {
             var violations = new List<string>();
+
+
+            decimal dailyTransactionLimit = Convert.ToDecimal(tenantSettings.VelocityLimits.Daily);
+            decimal dailyTansactionProcessed = Convert.ToDecimal(tenantVelocity?.PaymentProcessed ?? string.Empty);
 
             decimal perTransactionLimit = Convert.ToDecimal(tenantSettings.Thresholds.PerTransaction);
             decimal transactionAmount = Convert.ToDecimal(transaction.Amount);
 
             if (transactionAmount > perTransactionLimit)
             {
-                violations.Add($"Threshold limit exceeded. Per Transaction limit: {perTransactionLimit}. Transaction amount: {transactionAmount}");
+                violations.Add($"Per Transaction limit exceeded. Per Transaction limit: {perTransactionLimit}. Transaction amount: {transactionAmount}");
+            }
+
+            if (tenantVelocity != null && (dailyTansactionProcessed + transactionAmount) > dailyTransactionLimit)
+            {
+                violations.Add($"Daily Transaction limit exceeded. Daily Transaction limit: {dailyTransactionLimit}. Transaction amount already processed: {dailyTansactionProcessed}");
             }
 
             if (!tenantSettings.CountrySanctions.SourceCountries.Contains(transaction.SourceAccount.CountryCode))

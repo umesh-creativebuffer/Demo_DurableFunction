@@ -1,4 +1,5 @@
 ﻿using Newtonsoft.Json;
+using System;
 
 namespace Demo_DurableFunction.Models
 {
@@ -14,7 +15,8 @@ namespace Demo_DurableFunction.Models
         public string TransactionId { get; set; }
 
         [JsonProperty("transactionDate")]
-        public string TransactionDate { get; set; }
+        public string Date { get; set; }
+        public DateTime TransactionDate => Convert.ToDateTime(Date);
 
         [JsonProperty("direction")]
         public string Direction { get; set; }
