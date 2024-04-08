@@ -1,3 +1,4 @@
+using Azure.Storage.Blobs;
 using Demo_DurableFunction.Models;
 using Microsoft.Azure.Amqp.Framing;
 using Microsoft.Azure.WebJobs;
@@ -24,7 +25,7 @@ namespace Demo_DurableFunction
             var tenantSettings = await context.CallActivityAsync<TenantSettings>("LoadTenantSettings", transaction.TenantId);
 
             // Load Tenant Velocity
-            var tenantVelocities = await context.CallActivityAsync<TenantVelocity>("LoadTenantVelocities", transaction);
+            var tenantVelocities = await context.CallActivityAsync<TenantVelocity>("ReadFromBlob", transaction);
 
             // Assess the incoming message against the restrictions defined in the Tenant settings
             var violations = AssessRestrictions(transaction, tenantSettings, tenantVelocities);
@@ -32,6 +33,7 @@ namespace Demo_DurableFunction
             if (violations.Any())
             {
                 // Send the payment to a holding queue for assessment
+                await context.CallActivityAsync("SaveToBlob", transaction);
                 await context.CallActivityAsync("SendToHoldingQueue", transaction);
                 // Raise an event for the violations
                 await context.CallActivityAsync("RaiseViolationEvent", violations);
@@ -74,45 +76,6 @@ namespace Demo_DurableFunction
         [FunctionName("SendToProcessingQueue")]
         public static void SendToProcessingQueue([ActivityTrigger] TransactionModel transaction, ILogger log)
         {
-            // Specify the path to your JSON file
-            string filePath = string.Format("{0}/Content/TenantVelocities.json", Directory.GetCurrentDirectory());
-
-            if (!File.Exists(filePath))
-            {
-                // Create the file
-                using (FileStream fs = File.Create(filePath))
-                {
-                    Console.WriteLine("File created successfully.");
-                }
-            }
-
-            // Read the JSON file
-            string tenantVelocitiesJson = File.ReadAllText(filePath);
-
-            // deserialize object
-            var tenantVelocityWrapper = JsonConvert.DeserializeObject<TenantVelocityWrapper>(tenantVelocitiesJson);
-
-            tenantVelocityWrapper = tenantVelocityWrapper ?? new TenantVelocityWrapper();
-
-            if (tenantVelocityWrapper.TenantVelocities.Any(x => x.TenantId == transaction.TenantId && x.TransactionDate.HasValue && x.TransactionDate == transaction.TransactionDate))
-            {
-                foreach (var item in tenantVelocityWrapper.TenantVelocities.Where(x => x.TenantId == transaction.TenantId && x.TransactionDate.HasValue && x.TransactionDate == transaction.TransactionDate))
-                {
-                    item.PaymentProcessed = item.PaymentProcessed + transaction.Amount;
-                }
-            }
-            else
-            {
-                tenantVelocityWrapper.TenantVelocities.Add(new TenantVelocity
-                {
-                    TenantId = transaction.TenantId,
-                    Date = transaction.TransactionDate.ToString("yyyy-MM-dd"),
-                    PaymentProcessed = transaction.Amount
-                });
-            }
-            // Write data to the file
-            File.WriteAllText(filePath, JsonConvert.SerializeObject(tenantVelocityWrapper));
-
             log.LogInformation($"Sending transaction {transaction.TransactionId} to processing queue.");
         }
 
@@ -143,43 +106,6 @@ namespace Demo_DurableFunction
                 var tenantSettings = JsonConvert.DeserializeObject<TenantWrapper>(tenantSettingsJson);
 
                 return tenantSettings.TenantSettings.FirstOrDefault(x => x.TenantId == tenantId);
-            }
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="tenantId"></param>
-        /// <param name="log"></param>
-        /// <returns></returns>
-        [FunctionName("LoadTenantVelocities")]
-        public static TenantVelocity LoadTenantVelocities([ActivityTrigger] TransactionModel model, ILogger log)
-        {
-            // Specify the path to your JSON file
-            string filePath = string.Format("{0}/Content/TenantVelocities.json", Directory.GetCurrentDirectory());
-
-            // Check if the file exists
-            if (!File.Exists(filePath))
-            {
-                Console.WriteLine("File not found.");
-
-                // Create the file
-                using (FileStream fs = File.Create(filePath))
-                {
-                    Console.WriteLine("File created successfully.");
-                }
-
-                return null;
-            }
-            else
-            {
-                // Read the JSON file
-                string tenantVelocitiesJson = File.ReadAllText(filePath);
-
-                // deserialize object
-                var tenantVelocities = JsonConvert.DeserializeObject<TenantVelocityWrapper>(tenantVelocitiesJson);
-
-                return tenantVelocities.TenantVelocities.FirstOrDefault(x => x.TenantId == model.TenantId && x.TransactionDate.HasValue && x.TransactionDate == model.TransactionDate);
             }
         }
 
@@ -221,6 +147,79 @@ namespace Demo_DurableFunction
             }
 
             return violations;
+        }
+
+        [FunctionName("SaveToBlob")]
+        public static async Task SaveToBlob([ActivityTrigger] TransactionModel transaction, ILogger log)
+        {
+            string blobName = "exampleBlob.txt";
+
+            var tenantVelocityWrapper = await ReadFromBlobAsync(blobName);
+
+            tenantVelocityWrapper = tenantVelocityWrapper ?? new TenantVelocityWrapper();
+
+            if (tenantVelocityWrapper.TenantVelocities.Any(x => x.TenantId == transaction.TenantId && x.TransactionDate.HasValue && x.TransactionDate == transaction.TransactionDate))
+            {
+                foreach (var item in tenantVelocityWrapper.TenantVelocities.Where(x => x.TenantId == transaction.TenantId && x.TransactionDate.HasValue && x.TransactionDate == transaction.TransactionDate))
+                {
+                    item.PaymentProcessed = item.PaymentProcessed + transaction.Amount;
+                }
+            }
+            else
+            {
+                tenantVelocityWrapper.TenantVelocities.Add(new TenantVelocity
+                {
+                    TenantId = transaction.TenantId,
+                    Date = transaction.TransactionDate.ToString("yyyy-MM-dd"),
+                    PaymentProcessed = transaction.Amount
+                });
+            }
+
+            await SaveToBlobAsync(JsonConvert.SerializeObject(tenantVelocityWrapper), blobName);
+        }
+
+        public static async Task SaveToBlobAsync(string data, string blobName)
+        {
+            string connectionString = "<your_storage_account_connection_string>";
+            BlobServiceClient blobServiceClient = new BlobServiceClient(connectionString);
+            BlobContainerClient containerClient = blobServiceClient.GetBlobContainerClient("<container_name>");
+            BlobClient blobClient = containerClient.GetBlobClient(blobName);
+
+            using (MemoryStream memoryStream = new MemoryStream())
+            {
+                using (StreamWriter writer = new StreamWriter(memoryStream))
+                {
+                    await writer.WriteAsync(data);
+                    await writer.FlushAsync();
+                    memoryStream.Position = 0;
+                    await blobClient.UploadAsync(memoryStream, true);
+                }
+            }
+        }
+
+        [FunctionName("ReadFromBlob")]
+        public static async Task<TenantVelocity> ReadFromBlob([ActivityTrigger] TransactionModel model, ILogger log)
+        {
+            string blobName = "exampleBlob.txt";
+            var tenantVelocities = await ReadFromBlobAsync(blobName);
+            return tenantVelocities.TenantVelocities.FirstOrDefault(x => x.TenantId == model.TenantId && x.TransactionDate.HasValue && x.TransactionDate == model.TransactionDate);
+        }
+
+        public static async Task<TenantVelocityWrapper> ReadFromBlobAsync(string blobName)
+        {
+            string connectionString = "<your_storage_account_connection_string>";
+            BlobServiceClient blobServiceClient = new BlobServiceClient(connectionString);
+            BlobContainerClient containerClient = blobServiceClient.GetBlobContainerClient("<container_name>");
+            BlobClient blobClient = containerClient.GetBlobClient(blobName);
+
+            string content = string.Empty;
+            var response = await blobClient.DownloadAsync();
+            using (var streamReader = new StreamReader(response.Value.Content))
+            {
+                content = await streamReader.ReadToEndAsync();
+            }
+            // deserialize object
+            return JsonConvert.DeserializeObject<TenantVelocityWrapper>(content);
         }
 
         ///// <summary>
